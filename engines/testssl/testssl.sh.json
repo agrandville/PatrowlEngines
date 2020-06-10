@@ -1,0 +1,12 @@
+{
+        "name": "Testssl.sh",
+        "version": "1.0",
+        "description": "TLS Scanner",
+        "allowed_asset_types": ["ip", "domain", "fqdn", "url", "ip-range", "ip-subnet"],
+        "options": {
+                "hosts":			{ "type": "required" },
+				"bin_path":			{ "type": "required", "value": "bin/testssl.sh" }
+        }
+}
+
+
