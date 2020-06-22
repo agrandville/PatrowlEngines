@@ -167,22 +167,7 @@ def status():
 @app.route('/engines/testssl/status/<scan_id>')
 def status_scan(scan_id):
     """Get status on scan identified by id."""
-    res = {"page": "status"}
-
-    try:
-        res = engine.getstatus_scan(scan_id)
-        return res
-    except Exception as ex:
-        app.logger.error(ex)
-        res.update({
-            "status": "error",
-            "details": {
-                "reason": "{}".format(ex)
-            }
-        })
-
-        return jsonify(res)
-
+    return engine.getstatus_scan(scan_id)
 
 @app.route('/engines/testssl/stopscans')
 def stop():
@@ -199,7 +184,65 @@ def stop_scan(scan_id):
 @app.route('/engines/testssl/getfindings/<scan_id>')
 def getfindings(scan_id):
     """Get findings on finished scans."""
-    return engine.getfindings(scan_id)
+    res = {"page": "getfindings", "scan_id": scan_id}
+
+    issues = []
+    findings = []
+    status = {"status": "SUCCESS"}
+
+    summary = {
+        "nb_issues": 0,
+        "nb_info": 0,
+        "nb_low": 0,
+        "nb_medium": 0,
+        "nb_high": 0,
+        "engine_name": "testssl",
+        "engine_version": "1"
+    }
+
+    # check if the scan is finished
+    try:
+        engine.getstatus_scan(scan_id)
+        if engine.scans[scan_id]['status'] not in ["FINISHED", "ERROR"]:
+            res.update({"status": engine.scans[scan_id]['status']})
+            return jsonify(res)
+    except Exception as ex:
+        res.update({"status": "ERROR",
+            "reason": ex.__str__()})
+        return jsonify(res)
+
+    # parse result files
+    for asset in engine.scans[scan_id]['assets']:
+        output_file = asset['output_file']
+        try:
+            output_file = "/home/test/PatrowlEngines/engines/testssl/results/testssl_123.tmp"
+            with open(output_file, 'r') as fd:
+                json_data = json.loads(fd.read())
+
+            _parse_results(status, findings, summary, json_data, scan_id, asset)
+        except Exception as ex:
+            message = "scan#{} asset#{} read file {} failed  {}".format(scan_id, asset['id'], output_file, ex.__str__())
+            engine.scans[scan_id].update( { "status": "error", "reason": message, "finished_at": int(time.time() * 1000) })
+            app.logger.error(message)
+            return
+
+    scan = {
+        "scan_id": scan_id,
+        "assets": engine.scans[scan_id]['assets'],
+        "options": engine.scans[scan_id]['options'],
+        "started_at": engine.scans[scan_id]['started_at'],
+        "finished_at": engine.scans[scan_id]['finished_at']
+    }
+
+    json_findings = []
+    a = ""
+    for finding in findings:
+        #json_findings.append(finding.__to_dict())
+        a = finding.__to_dict()
+
+    res.update(status)
+    res.update({"scan": scan, "summary": summary, "issues": json_findings})
+    return jsonify(res)
 
 
 @app.route('/engines/testssl/getreport/<scan_id>')
@@ -216,16 +259,19 @@ def startscan():
     if "status" in res.keys() and res["status"] != "INIT":
         return jsonify(res)
 
-    scan_id = res["details"]["scan_id"]
 
-    th = threading.Thread(
-        target=_scan_thread,
-        kwargs={
-            "scan_id": scan_id,
-            "asset": engine.scans[scan_id]["assets"],
-            "asset_port": ""})
-    th.start()
-    engine.scans[scan_id]['threads'].append(th)
+    scan_id = res["details"]["scan_id"]
+    engine.scans[scan_id].update({"results": []})
+
+    for asset in engine.scans[scan_id]["assets"]:
+        th = threading.Thread(
+            target=_scan_thread,
+            kwargs={
+                "scan_id": scan_id,
+                "asset": asset})
+        th.start()
+        engine.scans[scan_id]['threads'].append(th)
+
 
     engine.scans[scan_id]['status'] = "SCANNING"
 
@@ -234,21 +280,27 @@ def startscan():
     return jsonify(res)
 
 
-def _scan_thread(scan_id, asset, asset_port):
-    app.logger.info("scan#" + scan_id + " starting ...")
-    app.logger.debug("scan#" + scan_id + " assets " + json.dumps(engine.scans[scan_id]['assets']))
+def _scan_thread(scan_id, asset):
+    asset_id = asset["id"]
+    asset_pos = engine.scans[scan_id]["assets"].index(asset)
+
+    app.logger.info("scan#{} start scanning asset#{} {}...".format(scan_id, asset["id"],asset["value"]))
 
     output_dir = APP_BASE_DIR + "/results/"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    output_file = "{}/testssl_{}.tmp".format(
+    output_file = "{}/testssl_{}-{}.tmp".format(
         output_dir,
-        scan_id)
+        scan_id,
+        asset_id)
+
+    asset.update({"output_file": output_file })
+    engine.scans[scan_id]["assets"][asset_pos].update(asset)
 
     if os.path.exists(output_file):
         # os.remove(output_file)
-        app.logger.debug("scan#" + scan_id + " file removed " + output_file)
+        app.logger.info("scan#" + scan_id + " file removed " + output_file)
 
     cmd = APP_BIN_PATH + " -oJ " + output_file + " ";
 
@@ -258,49 +310,49 @@ def _scan_thread(scan_id, asset, asset_port):
         if type(options) == str:
             options = json.loads(options)
 
-        if isTrue(options['check_protocols']):
-            cmd += "-p "
-
-        if isTrue(options['check_certificat']):
-            cmd += "-S "
-
-        if isTrue(options["check_vulnerabilities"]):
-            cmd += "-U "
-
-        if isTrue(options["check_ciphers"]):
-            cmd += "-E "
+        for option in options.keys():
+            if option in 'check_protocols' and isTrue(options['check_protocols']):
+                cmd += "-p "
+            elif option in 'check_certificat' and isTrue(options['check_certificat']):
+                cmd += "-S "
+            elif option in 'check_vulnerabilities' and isTrue(options['check_vulnerabilities']):
+                cmd += "-U "
+            elif option in 'check_ciphers' and isTrue(options['check_ciphers']):
+                cmd += "-E "
+            else:
+                raise Exception("unknown option",option)
 
     except Exception as ex:
-        # engine.scans[scan_id]["state"] = "error"
-        # { "reason": "options read failed {}".format(ex) }
-        app.logger.debug("scan#" + scan_id + " options read failed " + str(ex))
+        message = "scan#{} asset#{} options parsing failed {}".format(scan_id, asset_id, ex.__str__())
+        asset.update({"status": "ERROR", "reason": message, "finished_at": int(time.time() * 1000) })
+        engine.scans[scan_id]["assets"][asset_pos].update(asset)
+        app.logger.error(message)
         return
 
-    cmd += asset[0]['value'];
-    # cmd = "sleep 1"
-    app.logger.debug("scan#" + scan_id + " starting... " + cmd)
+    cmd += asset['value'];
+    cmd = "sleep 1"
+    app.logger.debug("scan#{} asset#{} starting {}... ".format(scan_id, asset_id,cmd))
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    # wait process exit
     returncode = p.poll()
     while returncode is None:
-        app.logger.debug("scan#" + scan_id + " running...")
+        app.logger.debug("scan#{} asset#{} is running...".format( scan_id, asset_id ))
         time.sleep(5)
         returncode = p.poll()
 
+    # check return code
     if returncode == 0:
-        app.logger.debug("scan#" + scan_id + " parsing results...")
+        app.logger.debug("scan#{} asset#{} finished...".format( scan_id, asset_id ))
+    else:
+        message = "scan#{} asset#{} testssl exit code {}".format(scan_id, asset_id, returncode)
+        asset.update({"status": "ERROR", "reason": message, "finished_at": int(time.time() * 1000) })
+        engine.scans[scan_id]["assets"][asset_pos].update(asset)
+        app.logger.error(message)
+        return
 
-        try:
-            # output_file = "/home/test/PatrowlEngines/engines/testssl/results/testssl_68.tmp"
-            with open(output_file, 'r') as fd:
-                json_data = json.loads(fd.read())
-
-            _parse_results(json_data, engine.scans[scan_id])
-
-        except Exception as ex:
-            app.logger.error("scan#" + scan_id + " parse result failed " + str(ex))
-
-    engine.scans[scan_id]['status'] = "FINISHED"
+    asset.update({"status": "FINISHED", "finished_at": int(time.time() * 1000) })
+    engine.scans[scan_id]["assets"][asset_pos].update(asset)
 
 
 def FindItem(key, items):
@@ -318,74 +370,103 @@ def FindItem(key, items):
 
     return None
 
+def _parse_protocols(status, findings, summary, scan_id, asset, data):
+    # {
+    #   "id"           : "SSLv2",
+    #   "severity"     : "OK",
+    #   "finding"      : "not offered"
+    # }
+    #
+    try:
+        for entry in data:
+            new_finding = PatrowlEngineFinding(
+                issue_id=len(findings),
+                type="testssl_scan_protocols",
+                title="{} {}".format(entry["id"],entry['finding']),
+                description="{} {}".format(entry["id"],entry['finding']),
+                solution="n/a",
+                severity="info",
+                confidence="firm",
+                raw=jsonify(entry),
+                target_addrs=asset
+            )
+            findings.append(new_finding)
+    except Exception as ex:
+        status.update({"status": "ERROR", "reason": "_parse_protocols failed {}".format(ex.__str__())})
+        return False
 
-def _parse_results(json_output, scan):
-    issue_id = 0
-    findings = []
-    scan_id = scan["scan_id"]
+    return True
 
-    # Check file
-    # app.logger.info(json_output)
+def _parse_results(status, findings, summary, json_data, scan_id, asset):
 
-    # iterations over wanted items
-    for key in TESTSSL_OUTPUT:
+    message = ""
+    nb_vulns = {
+        "info": 0,
+        "low": 0,
+        "medium": 0,
+        "high": 0
+    }
 
-        # iterations over items find in response
-        for result in json_output['scanResult'][0][key]:
 
-            # find item
-            item = FindItem(result["id"], TESTSSL_OUTPUT[key].keys())
-            if item is not None:
-                issue_id += 1
-                new_finding = PatrowlEngineFinding(
-                    issue_id=issue_id,
-                    type="testssl_scan_{}".format(key),
-                    title=TESTSSL_OUTPUT[key][item].format(result["finding"]),
-                    description=TESTSSL_OUTPUT[key][item].format(result["finding"]),
-                    solution="n/a",
-                    severity="info",
-                    confidence="firm",
-                    raw=result["id"] + " " + result["finding"],
-                    target_addrs={scan['assets'][0]['value']: {"datatype": scan['assets'][0]['datatype']}}
-                )
-                findings.append(new_finding)
+    # iterations over items in response
+    ret = True
+    for result in json_data['scanResult'][0]:
+        if result == "protocols":
+            ret = _parse_protocols(status, findings, summary,
+                                   scan_id, asset,
+                                   json_data['scanResult'][0]['protocols'])
+        elif result == "scanResult":
+                print(result)
 
-                # iterations over certificats
-                if result["id"] == 'cert_numbers':
-                    for current_certificate in range(1, 1 + int(format(result["finding"]))):
-                        for key_id in TESTSSL_TLS_CERT_ID.keys():
-                            if int(format(result["finding"])) == 1:
-                                search_id = key_id.format("")
-                                cert_id = ""
-                            else:
-                                cert_id = " <cert#" + str(current_certificate) + ">"
-                                search_id = key_id.format(cert_id)
+        if not ret:
+            break
 
-                            for certificats_attributs in json_output['scanResult'][0][key]:
-                                if certificats_attributs['id'] == search_id:
-                                    issue_id += 1
-                                    new_finding = PatrowlEngineFinding(
-                                        issue_id=issue_id,
-                                        type="testssl_scan_{}".format(key),
-                                        title=TESTSSL_TLS_CERT_ID[key_id].format(cert_id,
-                                                                                 certificats_attributs['finding']),
-                                        description=TESTSSL_TLS_CERT_ID[key_id].format(cert_id, certificats_attributs[
-                                            'finding']),
-                                        solution="n/a",
-                                        severity="info",
-                                        confidence="firm",
-                                        raw=certificats_attributs["id"] + " " + certificats_attributs["finding"],
-                                        target_addrs={
-                                            scan['assets'][0]['value']: {"datatype": scan['assets'][0]['datatype']}}
-                                    )
-                                    findings.append(new_finding)
+        # find item
+        # item = FindItem(result["id"], TESTSSL_OUTPUT[key].keys())
+        if False:
+            #if item is not None:
+            issue_id += 1
+
+
+            # iterations over certificats
+            if result["id"] == 'cert_numbers':
+                for current_certificate in range(1, 1 + int(format(result["finding"]))):
+                    for key_id in TESTSSL_TLS_CERT_ID.keys():
+                        if int(format(result["finding"])) == 1:
+                            search_id = key_id.format("")
+                            cert_id = ""
+                        else:
+                            cert_id = " <cert#" + str(current_certificate) + ">"
+                            search_id = key_id.format(cert_id)
+
+                        for certificats_attributs in json_output['scanResult'][0][key]:
+                            if certificats_attributs['id'] == search_id:
+                                issue_id += 1
+                                new_finding = PatrowlEngineFinding(
+                                    issue_id=issue_id,
+                                    type="testssl_scan_{}".format(key),
+                                    title=TESTSSL_TLS_CERT_ID[key_id].format(cert_id,
+                                                                             certificats_attributs['finding']),
+                                    description=TESTSSL_TLS_CERT_ID[key_id].format(cert_id, certificats_attributs[
+                                        'finding']),
+                                    solution="n/a",
+                                    severity="info",
+                                    confidence="firm",
+                                    raw=certificats_attributs["id"] + " " + certificats_attributs["finding"],
+                                    target_addrs={
+                                        scan['assets'][0]['value']: {"datatype": scan['assets'][0]['datatype']}}
+                                )
+                                findings.append(new_finding)
+
+
 
     # Write results under mutex
     scan_lock = threading.RLock()
     with scan_lock:
         engine.scans[scan_id]["findings"] += findings
 
-    return True
+
+
 
 
 def isTrue(v):
