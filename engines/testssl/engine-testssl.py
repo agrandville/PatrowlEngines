@@ -11,7 +11,7 @@ import threading
 import time
 import re
 from urllib.parse import urlparse
-
+from pathlib import Path
 from PatrowlEnginesUtils.PatrowlEngine import PatrowlEngine
 from PatrowlEnginesUtils.PatrowlEngine import PatrowlEngineFinding
 from PatrowlEnginesUtils.PatrowlEngineExceptions import PatrowlEngineExceptions
@@ -185,6 +185,7 @@ def stop_scan(scan_id):
 def getfindings(scan_id):
     """Get findings on finished scans."""
     res = {"page": "getfindings", "scan_id": scan_id}
+    message = ""
 
     issues = []
     findings = []
@@ -204,7 +205,7 @@ def getfindings(scan_id):
     try:
         engine.getstatus_scan(scan_id)
         if engine.scans[scan_id]['status'] not in ["FINISHED", "ERROR"]:
-            res.update({"status": engine.scans[scan_id]['status']})
+            res.update({"status": engine.scans[scan_id]['status'], "reason": engine.scans[scan_id]['reason']})
             return jsonify(res)
     except Exception as ex:
         res.update({"status": "ERROR",
@@ -213,18 +214,23 @@ def getfindings(scan_id):
 
     # parse result files
     for asset in engine.scans[scan_id]['assets']:
-        output_file = asset['output_file']
         try:
-            output_file = "/home/test/PatrowlEngines/engines/testssl/results/testssl_123.tmp"
-            with open(output_file, 'r') as fd:
-                json_data = json.loads(fd.read())
+            if asset["status"] == "ERROR":
+                raise PatrowlEngineExceptions(1003,asset["reason"])
+            else:
+                output_file = asset['output_file']
+                #output_file = "/home/test/PatrowlEngines/engines/testssl/results/testssl_123.tmp"
+                with open(output_file, 'r') as fd:
+                    json_data = json.loads(fd.read())
 
-            _parse_results(status, findings, summary, json_data, scan_id, asset)
+                _parse_results(status, findings, summary, json_data, scan_id, asset)
         except Exception as ex:
-            message = "scan#{} asset#{} read file {} failed  {}".format(scan_id, asset['id'], output_file, ex.__str__())
-            engine.scans[scan_id].update( { "status": "error", "reason": message, "finished_at": int(time.time() * 1000) })
+            message = "scan#{} asset#{} failed  {}".format(scan_id, asset['id'], ex.__str__())
+            status = { "status": "error", "reason": message, "finished_at": int(time.time() * 1000) }
+            engine.scans[scan_id].update(status)
             app.logger.error(message)
-            return
+            res.update(status)
+            return jsonify(res)
 
     scan = {
         "scan_id": scan_id,
@@ -237,12 +243,28 @@ def getfindings(scan_id):
     json_findings = []
     a = ""
     for finding in findings:
-        #json_findings.append(finding.__to_dict())
-        a = finding.__to_dict()
+        json_findings.append(finding._PatrowlEngineFinding__to_dict())
+
+    # Store the findings in a file
+    output_dir = Path(APP_BASE_DIR)
+    output_dir = Path(output_dir / "results")
+    output_file = output_dir / "testssl_{}.json".format(
+        scan_id
+    )
+
+    with open(output_file, 'w') as report_file:
+        json.dump({
+            "scan": scan,
+            "summary": summary,
+            "issues": issues
+        }, report_file)
+
+    # remove the scan from the active scan list
+    # clean_scan(scan_id)
 
     res.update(status)
     res.update({"scan": scan, "summary": summary, "issues": json_findings})
-    return jsonify(res)
+    return res
 
 
 @app.route('/engines/testssl/getreport/<scan_id>')
@@ -286,23 +308,23 @@ def _scan_thread(scan_id, asset):
 
     app.logger.info("scan#{} start scanning asset#{} {}...".format(scan_id, asset["id"],asset["value"]))
 
-    output_dir = APP_BASE_DIR + "/results/"
+    output_dir = Path(APP_BASE_DIR)
+    output_dir = Path(output_dir / "results")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    output_file = "{}/testssl_{}-{}.tmp".format(
-        output_dir,
-        scan_id,
+    output_file = output_dir / "testssl_{}-{}.tmp".format(
+        317, #scan_id,
         asset_id)
 
-    asset.update({"output_file": output_file })
+    asset.update({"output_file": str(output_file) })
     engine.scans[scan_id]["assets"][asset_pos].update(asset)
 
     if os.path.exists(output_file):
         # os.remove(output_file)
-        app.logger.info("scan#" + scan_id + " file removed " + output_file)
+        app.logger.info("scan#{} file removed {}.".format(scan_id, output_file))
 
-    cmd = APP_BIN_PATH + " -oJ " + output_file + " ";
+    cmd = APP_BIN_PATH + " -oJ {} ".format(output_file)
 
     try:
         options = engine.scans[scan_id]['options']
@@ -323,13 +345,13 @@ def _scan_thread(scan_id, asset):
                 raise Exception("unknown option",option)
 
     except Exception as ex:
-        message = "scan#{} asset#{} options parsing failed {}".format(scan_id, asset_id, ex.__str__())
+        message = "error {}".format(ex.__str__())
         asset.update({"status": "ERROR", "reason": message, "finished_at": int(time.time() * 1000) })
         engine.scans[scan_id]["assets"][asset_pos].update(asset)
         app.logger.error(message)
         return
 
-    cmd += asset['value'];
+    cmd += asset['value']
     cmd = "sleep 1"
     app.logger.debug("scan#{} asset#{} starting {}... ".format(scan_id, asset_id,cmd))
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -387,8 +409,8 @@ def _parse_protocols(status, findings, summary, scan_id, asset, data):
                 solution="n/a",
                 severity="info",
                 confidence="firm",
-                raw=jsonify(entry),
-                target_addrs=asset
+                raw=entry,
+                target_addrs=[asset["value"]]
             )
             findings.append(new_finding)
     except Exception as ex:
